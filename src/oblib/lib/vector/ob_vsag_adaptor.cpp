@@ -210,11 +210,10 @@ static void *ob_cuvs_job(void *arg) {
       j->built_ = true;
     }
   }
-  // Freshness/correctness: only serve from the GPU when the cuVS index is
-  // up-to-date with the buffer. If rows were added since the last build, the
-  // caller falls back to CPU VSAG (which is always fresh). This also gives the
-  // desired split: streaming delta -> VSAG, stable snapshot -> cuVS.
-  if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
+  // The CAGRA graph covers the first built_n_ rows. The caller exact-searches
+  // any newer tail rows and merges them with these GPU results, so a small DML
+  // delta never requires a synchronous full CPU HNSW rebuild.
+  if (j->ent->bridge_ != nullptr) {
     j->rc_ = seekdb_cuvs_search(j->ent->bridge_.get(), j->query, 1, j->topk,
                                 j->off->data(), j->dst->data());
   }
@@ -329,51 +328,120 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *query, int /*dim*/, int64_t topk,
                                const float *&dist, const int64_t *&ids,
                                int64_t &result_size, void *filter, bool reverse_filter) {
-  if (topk <= 0) { return false; }
+  if (query == nullptr || topk <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return false; }
   ObCuvsEntry *ent = it->second;
-  // Lazily (re)build the GPU CAGRA index when there are enough points and either
-  // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
+  // Rebuild only when there is no GPU graph or the buffer has grown by 2x.
+  // Between rebuilds, serve the graph and exact-search the newer tail rows.
   const size_t n = ent->buf_ids_.size();
+  const int dim = ent->dim_;
+  if (dim <= 0 || ent->buf_vecs_.size() < n * static_cast<size_t>(dim)) { return false; }
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
-  std::vector<unsigned> off(topk);
-  std::vector<float> dst(topk);
-  ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
+  if (!need_build && ent->bridge_ == nullptr) { return false; }
+
+  const size_t search_k = std::min(static_cast<size_t>(topk),
+                                   ent->bridge_ == nullptr ? n : ent->built_n_);
+  if (search_k == 0) { return false; }
+  std::vector<unsigned> off(search_k);
+  std::vector<float> dst(search_k);
+  ObCuvsJob job{ent, query, static_cast<int64_t>(search_k), dim, n,
+                need_build, &off, &dst, -1, false};
   if (!ob_cuvs_submit_job(job)) { return false; }
-  if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
+  if (job.built_) {
+    ob_vsag_trace("cuvs_build", key, static_cast<long>(dim), static_cast<long>(n));
+  }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
-  // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
-  // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
-  // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
-  // excluded, fall back to VSAG (the true filtered top-k may rank beyond k here).
-  if (filter != nullptr) {
-    FilterInterface *fi = static_cast<FilterInterface *>(filter);
-    for (int64_t i = 0; i < topk; ++i) {
-      int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
-      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
-      if (!valid) { return false; }
+
+  FilterInterface *fi = static_cast<FilterInterface *>(filter);
+  std::vector<std::pair<float, int64_t>> candidates;
+  candidates.reserve(search_k + (n - ent->built_n_));
+  bool need_full_scan = false;
+  const size_t built_n = ent->built_n_;
+  for (size_t i = 0; i < search_k; ++i) {
+    const unsigned offset = off[i];
+    if (offset >= built_n || offset >= ent->ids_.size()) {
+      need_full_scan = true;
+      continue;
+    }
+    const int64_t vid = ent->ids_[offset];
+    const bool valid = fi == nullptr || (reverse_filter ? fi->test(vid) : !fi->test(vid));
+    if (valid) {
+      candidates.emplace_back(dst[i], vid);
+    } else {
+      need_full_scan = true;
     }
   }
+
+  auto exact_search_rows = [&](size_t first_row) {
+    for (size_t row = first_row; row < n; ++row) {
+      const int64_t vid = ent->buf_ids_[row];
+      const bool valid = fi == nullptr || (reverse_filter ? fi->test(vid) : !fi->test(vid));
+      if (!valid) { continue; }
+      const float *vector = ent->buf_vecs_.data() + row * static_cast<size_t>(dim);
+      float distance = 0.0f;
+      for (int d = 0; d < dim; ++d) {
+        const float delta = vector[d] - query[d];
+        distance += delta * delta;
+      }
+      candidates.emplace_back(distance, vid);
+    }
+  };
+  if (need_full_scan) {
+    // hipVS currently rejects over-fetching beyond topk=100. A filtered GPU
+    // result therefore switches to an exact scan, not a costly CPU HNSW build.
+    candidates.clear();
+    candidates.reserve(n);
+    exact_search_rows(0);
+  } else {
+    exact_search_rows(built_n);
+  }
+
+  const size_t capacity = std::min(static_cast<size_t>(topk), candidates.size());
+  if (capacity == 0) {
+    ids = nullptr;
+    dist = nullptr;
+    result_size = 0;
+    return true;
+  }
+  const bool preserve_gpu_order = !need_full_scan && built_n == n;
+  if (!preserve_gpu_order) {
+    std::sort(candidates.begin(), candidates.end());
+  }
   int64_t *out_ids = static_cast<int64_t *>(
-      alloc ? alloc->Allocate(sizeof(int64_t) * topk) : ::malloc(sizeof(int64_t) * topk));
+      alloc ? alloc->Allocate(sizeof(int64_t) * capacity) : ::malloc(sizeof(int64_t) * capacity));
   float *out_dist = static_cast<float *>(
-      alloc ? alloc->Allocate(sizeof(float) * topk) : ::malloc(sizeof(float) * topk));
+      alloc ? alloc->Allocate(sizeof(float) * capacity) : ::malloc(sizeof(float) * capacity));
   if (out_ids == nullptr || out_dist == nullptr) {
     if (alloc) { if (out_ids) alloc->Deallocate(out_ids); if (out_dist) alloc->Deallocate(out_dist); }
     else { ::free(out_ids); ::free(out_dist); }
     return false;
   }
-  for (int64_t i = 0; i < topk; ++i) {
-    unsigned o = off[i];
-    out_ids[i] = (o < ent->ids_.size()) ? ent->ids_[o] : -1;
-    out_dist[i] = dst[i];
+  size_t count = 0;
+  if (preserve_gpu_order) {
+    // The common no-DML path is already sorted and unique: keep it allocation-
+    // light instead of sorting and deduplicating the same 100 results again.
+    count = capacity;
+    for (size_t i = 0; i < count; ++i) {
+      out_dist[i] = candidates[i].first;
+      out_ids[i] = candidates[i].second;
+    }
+  } else {
+    std::set<int64_t> emitted;
+    for (const auto &candidate : candidates) {
+      if (!emitted.insert(candidate.second).second) { continue; }
+      out_dist[count] = candidate.first;
+      out_ids[count] = candidate.second;
+      ++count;
+      if (count == capacity) { break; }
+    }
   }
-  ids = out_ids; dist = out_dist; result_size = topk;
-  ob_vsag_trace("cuvs_serve", key, static_cast<long>(topk), static_cast<long>(ent->ids_.size()));
+  ids = out_ids;
+  dist = out_dist;
+  result_size = count;
+  ob_vsag_trace("cuvs_serve", key, static_cast<long>(count), static_cast<long>(n));
   return true;
 }
 

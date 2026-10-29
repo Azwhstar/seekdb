@@ -1224,6 +1224,9 @@ int ObPluginVectorIndexAdaptor::handle_insert_incr_table_rows(blocksstable::ObDa
       for (int64_t i = 0; OB_SUCC(ret) && i < del_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_remove(incr_data_->bitmap_->insert_bitmap_, del_vids[i]));
       }
+      if (OB_SUCC(ret) && incr_data_->delta_synced_) {
+        incr_data_->delta_synced_version_ = incr_data_->delta_dml_version_;
+      }
     }
   }
 
@@ -1339,6 +1342,9 @@ int ObPluginVectorIndexAdaptor::handle_insert_embedded_table_rows(blocksstable::
       }
       for (int64_t i = 0; OB_SUCC(ret) && i < null_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_add(incr_data_->bitmap_->insert_bitmap_, null_vids[i]));
+      }
+      if (OB_SUCC(ret) && incr_data_->delta_synced_) {
+        incr_data_->delta_synced_version_ = incr_data_->delta_dml_version_;
       }
     }
 
@@ -1641,6 +1647,11 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
       }
       for (int64_t i = 0; OB_SUCC(ret) && i < null_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_add(incr_data_->bitmap_->insert_bitmap_, null_vids[i]));
+      }
+      if (OB_SUCC(ret) && incr_data_->delta_synced_) {
+        // DML has already updated the cached delta bitmap under this write
+        // lock. Mark it current so the next query need not rescan the table.
+        incr_data_->delta_synced_version_ = incr_data_->delta_dml_version_;
       }
     }
 
