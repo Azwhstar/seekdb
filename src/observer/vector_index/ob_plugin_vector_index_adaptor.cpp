@@ -1220,6 +1220,7 @@ int ObPluginVectorIndexAdaptor::handle_insert_incr_table_rows(blocksstable::ObDa
     if (OB_SUCC(ret)) {
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIBitmapADPH"));
       TCWLockGuard lock_guard(incr_data_->bitmap_rwlock_);
+      incr_data_->delta_dml_version_++;
       for (int64_t i = 0; OB_SUCC(ret) && i < del_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_remove(incr_data_->bitmap_->insert_bitmap_, del_vids[i]));
       }
@@ -1332,6 +1333,7 @@ int ObPluginVectorIndexAdaptor::handle_insert_embedded_table_rows(blocksstable::
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIBitmapADPH"));
       TCWLockGuard lock_guard(incr_data_->bitmap_rwlock_);
       incr_data_->set_vid_bound(vid_bound);
+      incr_data_->delta_dml_version_++;
       for (int64_t i = 0; OB_SUCC(ret) && i < incr_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_add(incr_data_->bitmap_->insert_bitmap_, incr_vids[i]));
       }
@@ -1630,6 +1632,7 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIBitmapADPH"));
       TCWLockGuard lock_guard(incr_data_->bitmap_rwlock_);
       incr_data_->set_vid_bound(vid_bound);
+      incr_data_->delta_dml_version_++;
       for (int64_t i = 0; OB_SUCC(ret) && i < incr_vid_count; i++) {
         CROARING_TRY_CATCH(roaring::api::roaring64_bitmap_add(incr_data_->bitmap_->insert_bitmap_, incr_vids[i]));
       }
@@ -2201,6 +2204,34 @@ int ObPluginVectorIndexAdaptor::check_delta_buffer_table_readnext_status(ObVecto
   INIT_SUCC(ret);
   SCN min_delta_scn;
   bool can_skip = true;
+  const ObVectorIndexParam *param = static_cast<const ObVectorIndexParam *>(algo_data_);
+  const bool enable_delta_reuse = param != nullptr
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH);
+  // Reuse the materialized delta bitmap only while its version matches the
+  // latest DML version. The scan version is captured before reading the table;
+  // a concurrent DML therefore causes the following query to rescan.
+  if (enable_delta_reuse && OB_NOT_NULL(ctx) && OB_NOT_NULL(row_iter)
+      && is_mem_data_init_atomic(VIRT_INC)
+      && OB_NOT_NULL(incr_data_->bitmap_)) {
+    if (OB_FAIL(ctx->init_bitmaps())) {
+    } else {
+      lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIBitmapADPR"));
+      TCRLockGuard lock_guard(incr_data_->bitmap_rwlock_);
+      if (incr_data_->delta_synced_
+          && incr_data_->delta_synced_version_ == incr_data_->delta_dml_version_) {
+        CROARING_TRY_CATCH(roaring64_bitmap_or_inplace(
+            ctx->bitmaps_->insert_bitmap_, incr_data_->bitmap_->insert_bitmap_));
+        CROARING_TRY_CATCH(roaring64_bitmap_or_inplace(
+            ctx->bitmaps_->delete_bitmap_, incr_data_->bitmap_->delete_bitmap_));
+        ctx->status_ = PVQ_LACK_SCN;
+        return ret;
+      }
+      ctx->delta_scan_version_ = incr_data_->delta_dml_version_;
+    }
+  }
   // TODO First determine if waiting for PVQ_WAIT is needed
   if (OB_ISNULL(ctx) || OB_ISNULL(row_iter)) {
     ret = OB_ERR_UNEXPECTED;
@@ -2262,6 +2293,39 @@ int ObPluginVectorIndexAdaptor::check_delta_buffer_table_readnext_status(ObVecto
 
     if (OB_SUCC(ret)) {
       ctx->status_ = PVQ_LACK_SCN;
+      // Save the pure delta bitmap immediately after the complete table scan.
+      // Waiting until query_result() is too late: merge_and_generate_bitmap()
+      // has already folded the snapshot bitmap into the query context there.
+      if (enable_delta_reuse && is_mem_data_init_atomic(VIRT_INC) && OB_NOT_NULL(incr_data_->bitmap_)
+          && ctx->delta_scan_version_ == incr_data_->delta_dml_version_) {
+        TCWLockGuard lock_guard(incr_data_->bitmap_rwlock_);
+        if (ctx->delta_scan_version_ == incr_data_->delta_dml_version_) {
+          // The original delta bitmap uses ob_malloc under a VIBitmap attr;
+          // its copies must be allocated and freed through the same path.
+          lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIBitmapADPF"));
+          roaring::api::roaring64_bitmap_t *insert_bitmap = nullptr;
+          roaring::api::roaring64_bitmap_t *delete_bitmap = nullptr;
+          CROARING_TRY_CATCH(insert_bitmap =
+              roaring::api::roaring64_bitmap_copy(ctx->bitmaps_->insert_bitmap_));
+          CROARING_TRY_CATCH(delete_bitmap =
+              roaring::api::roaring64_bitmap_copy(ctx->bitmaps_->delete_bitmap_));
+          if (OB_NOT_NULL(insert_bitmap) && OB_NOT_NULL(delete_bitmap)) {
+            if (OB_NOT_NULL(incr_data_->bitmap_->insert_bitmap_)) {
+              roaring::api::roaring64_bitmap_free(incr_data_->bitmap_->insert_bitmap_);
+            }
+            if (OB_NOT_NULL(incr_data_->bitmap_->delete_bitmap_)) {
+              roaring::api::roaring64_bitmap_free(incr_data_->bitmap_->delete_bitmap_);
+            }
+            incr_data_->bitmap_->insert_bitmap_ = insert_bitmap;
+            incr_data_->bitmap_->delete_bitmap_ = delete_bitmap;
+            incr_data_->delta_synced_version_ = ctx->delta_scan_version_;
+            incr_data_->delta_synced_ = true;
+          } else {
+            if (OB_NOT_NULL(insert_bitmap)) { roaring::api::roaring64_bitmap_free(insert_bitmap); }
+            if (OB_NOT_NULL(delete_bitmap)) { roaring::api::roaring64_bitmap_free(delete_bitmap); }
+          }
+        }
+      }
     }
   }
   return ret;

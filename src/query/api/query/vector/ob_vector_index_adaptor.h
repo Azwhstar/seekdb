@@ -275,7 +275,8 @@ public:
       batch_allocator_("BATCHALLOC", OB_MALLOC_NORMAL_BLOCK_SIZE),
       search_allocator_{},
       ls_leader_(true),
-      is_sparse_vector_(false) {};
+      is_sparse_vector_(false),
+      delta_scan_version_(0) {};
   ~ObVectorQueryAdaptorResultContext();
   int init_bitmaps();
   int init_prefilter(const int64_t &min, const int64_t &max);
@@ -334,6 +335,7 @@ private:
   ObVsagSearchAlloc search_allocator_;
   bool ls_leader_;
   bool is_sparse_vector_;
+  uint64_t delta_scan_version_;
 };
 
 class ObVectorQueryConditions {
@@ -432,7 +434,10 @@ struct ObVectorIndexMemData
       mem_ctx_(nullptr),
       last_dml_scn_(),
       last_read_scn_(),
-      can_skip_(NOT_INITED) {}
+      can_skip_(NOT_INITED),
+      delta_dml_version_(0),
+      delta_synced_version_(0),
+      delta_synced_(false) {}
 
 public:
   TO_STRING_KV(K(rb_flag_), K_(is_init), K_(scn), K_(ref_cnt), K(vid_bound_.max_vid_), K(vid_bound_.min_vid_), KP_(index), KPC_(bitmap), KP_(mem_ctx));
@@ -483,6 +488,9 @@ public:
   SCN last_dml_scn_;
   SCN last_read_scn_;
   ObCanSkip3rdAnd4thVecIndex can_skip_;
+  uint64_t delta_dml_version_;
+  uint64_t delta_synced_version_;
+  bool delta_synced_;
 };
 
 struct ObVectorIndexFollowerSyncStatic
